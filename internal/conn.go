@@ -48,6 +48,9 @@ type Conn struct {
 	systemVars     map[string]string
 	scriptVars     map[string]string
 	materializeCTE bool
+	// owner is the driver connection that created this Conn, for the
+	// statement hook.
+	owner any
 }
 
 func newConn(conn *sql.Conn, tx *sql.Tx) *Conn {

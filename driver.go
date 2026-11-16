@@ -321,6 +321,12 @@ type Conn struct {
 	scriptVars     map[string]string
 	materializeCTE bool
 
+	// handlerAnalyzer analyzes the statements a StatementHandler runs, so
+	// that they do not change the name path of analyzer.
+	handlerAnalyzer *internal.Analyzer
+	// nested is set on the Conn handed to a StatementHandler.
+	nested *nestedState
+
 	// dead is set when an operation on this Conn observes that the
 	// inner *sql.Conn has been closed (sql.ErrConnDone). database/sql
 	// pools Conn values across requests; without an explicit signal it
@@ -459,6 +465,7 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt,
 	defer func() { e = c.translateConnDone(e) }()
 	defer recoverPanicAsError(&e)
 	conn := internal.NewConnWithOptions(c.conn, nil, c.systemVars, c.scriptVars, c.materializeCTE)
+	conn.SetOwner(c)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, nil)
 	if err != nil {
 		return nil, err
@@ -482,6 +489,8 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	defer func() { e = c.translateConnDone(e) }()
 	defer recoverPanicAsError(&e)
 	conn := internal.NewConnWithOptions(c.conn, nil, c.systemVars, c.scriptVars, c.materializeCTE)
+	conn.SetOwner(c)
+	defer c.mergeChangedCatalog(conn)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {
 		return nil, err
@@ -518,6 +527,8 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	defer func() { e = c.translateConnDone(e) }()
 	defer recoverPanicAsError(&e)
 	conn := internal.NewConnWithOptions(c.conn, nil, c.systemVars, c.scriptVars, c.materializeCTE)
+	conn.SetOwner(c)
+	defer c.mergeChangedCatalog(conn)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {
 		return nil, err
@@ -551,6 +562,10 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 }
 
 func (c *Conn) Close() error {
+	if c.nested != nil {
+		// The SQLite connection belongs to the statement being handled.
+		return nil
+	}
 	return c.conn.Close()
 }
 
@@ -558,6 +573,9 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (t driver.Tx,
 	defer func() { e = c.translateConnDone(e) }()
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if c.nested != nil {
+		return c.beginSavepoint(ctx)
 	}
 	txReset, err := c.beginExplicitTx(ctx, opts)
 	if err != nil {
@@ -572,6 +590,9 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (t driver.Tx,
 
 func (c *Conn) Begin() (t driver.Tx, e error) {
 	defer func() { e = c.translateConnDone(e) }()
+	if c.nested != nil {
+		return c.beginSavepoint(context.Background())
+	}
 	txReset, err := c.beginExplicitTx(context.Background(), driver.TxOptions{})
 	if err != nil {
 		return nil, err
@@ -632,9 +653,15 @@ func (c *Conn) beginExplicitTx(ctx context.Context, opts driver.TxOptions) (stri
 
 type Tx struct {
 	conn *Conn
+	// savepoint is the SAVEPOINT of a transaction started by a
+	// StatementHandler.
+	savepoint string
 }
 
 func (tx *Tx) Commit() error {
+	if tx.savepoint != "" {
+		return tx.conn.endSavepoint(tx.savepoint, true)
+	}
 	defer func() {
 		tx.conn.txActive = false
 		tx.conn.txReset = ""
@@ -647,6 +674,9 @@ func (tx *Tx) Commit() error {
 }
 
 func (tx *Tx) Rollback() error {
+	if tx.savepoint != "" {
+		return tx.conn.endSavepoint(tx.savepoint, false)
+	}
 	defer func() {
 		tx.conn.txActive = false
 		tx.conn.txReset = ""
