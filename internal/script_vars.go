@@ -2,13 +2,9 @@ package internal
 
 import (
 	"context"
-	"database/sql"
-	"database/sql/driver"
 	"strconv"
 	"strings"
 	"unicode"
-
-	"github.com/goccy/googlesqlite/internal/value"
 )
 
 // formatScriptInt / formatScriptFloat keep the literal forms small
@@ -55,50 +51,13 @@ func formatScriptFloat(v float64) string {
 //
 // Substitutions appear in the rewritten SQL parenthesised so binary
 // expressions like `id = x` survive when x is e.g. `1 + 2`.
-//
-// Query parameters on a DECLARE DEFAULT / SET right-hand side are bound
-// from args when the expression is evaluated: named ones by name, and
-// positional ones in the order their `?` appears in the script. The
-// positional values a DECLARE / SET consumes are removed from the
-// returned args, because its statement leaves the rewritten SQL and the
-// remaining statements must still receive their own values in order.
-func applyScriptVariables(ctx context.Context, query string, conn *Conn, args []driver.NamedValue) (string, []driver.NamedValue) {
+func applyScriptVariables(ctx context.Context, query string, conn *Conn) string {
 	if conn == nil {
-		return query, args
+		return query
 	}
 	stmts := splitTopLevelStatements(query)
 	if len(stmts) == 0 {
-		return query, args
-	}
-	// positional holds the indexes into args of the positional values
-	// in order; next is the first one no statement has claimed yet.
-	var positional []int
-	for i, v := range args {
-		if v.Name == "" {
-			positional = append(positional, i)
-		}
-	}
-	next := 0
-	consumed := map[int]struct{}{}
-	// evaluate substitutes earlier variables into expr and evaluates
-	// it with the parameters it references bound. When a referenced
-	// parameter is not available (e.g. at Prepare time, before args
-	// are bound) it keeps the parenthesised text instead, so the
-	// placeholder lands in the statement that uses the variable and is
-	// bound or rejected there; the positional values stay unclaimed.
-	evaluate := func(expr string) string {
-		expr = substituteScriptVariables(expr, conn)
-		bound, nPositional, ok := bindScriptParams(expr, args, positional[next:])
-		if ok {
-			if lit, ok := evaluateScriptVariableExpr(ctx, conn, expr, bound); ok {
-				for _, idx := range positional[next : next+nPositional] {
-					consumed[idx] = struct{}{}
-				}
-				next += nPositional
-				return lit
-			}
-		}
-		return parenthesizeScriptExpr(expr)
+		return query
 	}
 	var keep []string
 	for _, stmt := range stmts {
@@ -111,178 +70,69 @@ func applyScriptVariables(ctx context.Context, query string, conn *Conn, args []
 			// evaluate the result through SQLite to a concrete
 			// literal, and store the literal. This keeps repeated
 			// SET m = m + 1 from growing the text quadratically.
-			conn.SetScriptVariable(name, evaluate(expr))
+			lit := evaluateScriptVariableExpr(ctx, conn, substituteScriptVariables(expr, conn))
+			conn.SetScriptVariable(name, lit)
 			continue
 		}
 		if name, expr, ok := parseAssignment(trimmed); ok {
 			if _, declared := conn.ScriptVariable(name); declared {
-				conn.SetScriptVariable(name, evaluate(expr))
+				lit := evaluateScriptVariableExpr(ctx, conn, substituteScriptVariables(expr, conn))
+				conn.SetScriptVariable(name, lit)
 				continue
 			}
 			// Not a declared variable — fall through (handled by
 			// AssignmentStmtAction for @@vars; user error otherwise).
 		}
-		// Substitute any known variable into the surviving statement,
-		// and let it claim the positional values for its own `?`s.
-		kept := substituteScriptVariables(stmt, conn)
-		_, n := scanScriptParamRefs(kept)
-		next = min(next+n, len(positional))
-		keep = append(keep, kept)
-	}
-	if len(consumed) > 0 {
-		// Drop the values the DECLARE / SET statements bound and
-		// renumber the rest so the ordinals stay contiguous.
-		out := make([]driver.NamedValue, 0, len(args)-len(consumed))
-		for i, v := range args {
-			if _, ok := consumed[i]; ok {
-				continue
-			}
-			v.Ordinal = len(out) + 1
-			out = append(out, v)
-		}
-		args = out
+		// Substitute any known variable into the surviving statement.
+		keep = append(keep, substituteScriptVariables(stmt, conn))
 	}
 	if len(keep) == 0 {
 		// Pure DECLARE / SET script: feed the analyzer a no-op
 		// SELECT so it has something to do.
-		return "SELECT 1", args
+		return "SELECT 1"
 	}
-	return strings.Join(keep, "; "), args
+	return strings.Join(keep, "; ")
 }
 
-// bindScriptParams returns the arguments to evaluate a script variable
-// expression with: a sql.NamedArg for each `@name` it references, and
-// the next positional values in order for its `?`s. ok is false when a
-// referenced parameter is missing, or is written in a form this scan
-// does not recognise, so the caller must not evaluate the expression
-// (SQLite would silently read an unbound named parameter as NULL).
-func bindScriptParams(expr string, args []driver.NamedValue, positional []int) (bound []any, nPositional int, ok bool) {
-	names, nPositional := scanScriptParamRefs(expr)
-	if nPositional > len(positional) {
-		return nil, 0, false
-	}
-	for _, idx := range positional[:nPositional] {
-		bound = append(bound, args[idx].Value)
-	}
-	seen := map[string]struct{}{}
-	for _, name := range names {
-		if name == "" {
-			return nil, 0, false
-		}
-		if _, dup := seen[name]; dup {
-			continue
-		}
-		seen[name] = struct{}{}
-		found := false
-		for _, v := range args {
-			if v.Name != "" && strings.EqualFold(v.Name, name) {
-				bound = append(bound, sql.Named(name, v.Value))
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, 0, false
-		}
-	}
-	return bound, nPositional, true
-}
-
-// scanScriptParamRefs returns the `@name` parameter references in expr
-// as written, and the number of positional `?` placeholders, skipping
-// quoted literals and `@@` system variables. A reference it cannot
-// name, such as a backticked `@`name“, is reported as "".
-func scanScriptParamRefs(expr string) (names []string, nPositional int) {
-	for i := 0; i < len(expr); {
-		c := expr[i]
-		switch {
-		case c == '\'' || c == '"' || c == '`':
-			i = scanQuoted(expr, i, c)
-		case c == '?':
-			nPositional++
-			i++
-		case c == '@' && i+1 < len(expr) && expr[i+1] == '@':
-			// System variable: skip the `@@` and its name.
-			i += 2
-			i += scanIdent(expr[i:])
-		case c == '@':
-			n := scanIdent(expr[i+1:])
-			if n == 0 && i+1 < len(expr) && expr[i+1] == '`' {
-				names = append(names, "")
-			} else if n > 0 {
-				names = append(names, expr[i+1:i+1+n])
-			}
-			i += 1 + n
-		default:
-			i++
-		}
-	}
-	return names, nPositional
-}
-
-// parenthesizeScriptExpr is the fallback form of a script variable
-// whose expression could not be evaluated on its own.
-func parenthesizeScriptExpr(expr string) string {
+// evaluateScriptVariableExpr asks the underlying SQLite to compute
+// a single-row, single-column result for the given expression and
+// returns the result as a SQL literal. Falls back to a parenthesised
+// version of the original text when evaluation fails — that keeps
+// callers correct even for expressions whose only use is in another
+// statement (where SQLite's evaluator might reject them in isolation).
+func evaluateScriptVariableExpr(ctx context.Context, conn *Conn, expr string) string {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
 		return "NULL"
 	}
-	return "(" + expr + ")"
-}
-
-// evaluateScriptVariableExpr asks the underlying SQLite to compute
-// a single-row, single-column result for the given expression, with
-// args bound to its parameters, and returns the result as a SQL
-// literal. ok is false when evaluation fails; callers then fall back to
-// a parenthesised version of the original text, which keeps them
-// correct even for expressions whose only use is in another statement
-// (where SQLite's evaluator might reject them in isolation).
-func evaluateScriptVariableExpr(ctx context.Context, conn *Conn, expr string, args []any) (string, bool) {
-	expr = strings.TrimSpace(expr)
-	if expr == "" {
-		return "NULL", true
-	}
-	row := conn.QueryRowContext(ctx, "SELECT "+expr, args...)
+	row := conn.QueryRowContext(ctx, "SELECT "+expr)
 	var raw any
 	if err := row.Scan(&raw); err != nil {
-		return "", false
+		return "(" + expr + ")"
 	}
 	switch v := raw.(type) {
 	case nil:
-		return "NULL", true
+		return "NULL"
 	case int64:
-		return formatScriptInt(v), true
+		return formatScriptInt(v)
 	case float64:
-		return formatScriptFloat(v), true
+		return formatScriptFloat(v)
 	case bool:
 		if v {
-			return "TRUE", true
+			return "TRUE"
 		}
-		return "FALSE", true
+		return "FALSE"
 	case string:
-		// A bound query parameter arrives in the encoded envelope
-		// layout. A STRING one becomes a GoogleSQL string literal of
-		// its decoded text, escaped because the text is the value
-		// itself rather than literal source. Other encoded types
-		// have no literal form here, so the caller inlines the
-		// expression and its placeholder instead.
-		if decoded, err := DecodeValue(v); err == nil {
-			s, isString := decoded.(value.StringValue)
-			if !isString {
-				return "", false
-			}
-			if string(s) != v {
-				return strconv.Quote(string(s)), true
-			}
-		}
-		// A plain string from a literal in the expression. Quote with
+		// May be an envelope-encoded value; if so the caller-site
+		// substitution will store the envelope text and SQLite
+		// will read it back via the standard collation. Quote with
 		// double quotes (DQS_DML is enabled), matching the form
 		// LiteralFromValue emits for non-primitive values.
-		return "\"" + strings.ReplaceAll(v, "\"", "\\\"") + "\"", true
+		return "\"" + strings.ReplaceAll(v, "\"", "\\\"") + "\""
 	case []byte:
-		return "\"" + strings.ReplaceAll(string(v), "\"", "\\\"") + "\"", true
+		return "\"" + strings.ReplaceAll(string(v), "\"", "\\\"") + "\""
 	}
-	return "", false
+	return "(" + expr + ")"
 }
 
 // splitTopLevelStatements splits on `;` while respecting single

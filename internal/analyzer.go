@@ -1528,7 +1528,7 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	// steps.
 	query, args = applyMixedParameterRewrite(query, args)
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePreScriptVars)
-	query, args = applyScriptVariables(ctx, query, conn, args)
+	query = applyScriptVariables(ctx, query, conn)
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePostScriptVars)
 	parsed, err := a.parseScript(query)
 	if err != nil {
