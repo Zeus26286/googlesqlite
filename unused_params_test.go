@@ -3,6 +3,8 @@ package googlesqlite_test
 import (
 	"context"
 	"database/sql"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -239,5 +241,115 @@ func TestPreparedStmtUnusedParams(t *testing.T) {
 	}()
 	if got := queryOne("SELECT COUNT(*) FROM up_p"); got != 1 {
 		t.Fatalf("COUNT(*): got %d, want 1", got)
+	}
+}
+
+// TestMissingUsedParamErrors checks that ignoring unused parameters does
+// not hide a parameter the statement uses but the caller did not supply.
+func TestMissingUsedParamErrors(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=unused_params_missing")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	var a, b any
+	err = db.QueryRowContext(ctx, "SELECT @a, @b", sql.Named("b", int64(1))).Scan(&a, &b)
+	if err == nil || !strings.Contains(err.Error(), "not enough query arguments") {
+		t.Fatalf("expected an error containing %q, got %v", "not enough query arguments", err)
+	}
+}
+
+// TestScriptVariableParams checks that query parameters on the
+// right-hand side of a DECLARE DEFAULT or SET are bound when the
+// variable is evaluated, instead of evaluating to NULL. Positional
+// values are consumed in the order their `?` appears in the script.
+func TestScriptVariableParams(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=unused_params_script_vars")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		args  []any
+		want  []any
+	}{
+		{
+			name:  "declare_named",
+			query: "DECLARE x INT64 DEFAULT @p; SELECT x",
+			args:  []any{sql.Named("p", int64(4)), sql.Named("q", int64(1))},
+			want:  []any{int64(4)},
+		},
+		{
+			name:  "set_named",
+			query: "DECLARE x INT64 DEFAULT 1; SET x = @p; SELECT x",
+			args:  []any{sql.Named("p", int64(4))},
+			want:  []any{int64(4)},
+		},
+		{
+			name:  "set_named_repeated",
+			query: "DECLARE x INT64 DEFAULT @p; SET x = x + @p; SELECT x, @q",
+			args:  []any{sql.Named("p", int64(4)), sql.Named("q", int64(1))},
+			want:  []any{int64(8), int64(1)},
+		},
+		{
+			name:  "declare_named_string",
+			query: "DECLARE s STRING DEFAULT @s; SELECT s",
+			args:  []any{sql.Named("s", "a\\b\"c\nd'e")},
+			want:  []any{"a\\b\"c\nd'e"},
+		},
+		{
+			name:  "declare_positional",
+			query: "DECLARE d INT64 DEFAULT ?; SELECT d",
+			args:  []any{int64(4)},
+			want:  []any{int64(4)},
+		},
+		{
+			name:  "declare_positional_order",
+			query: "DECLARE d INT64 DEFAULT ?; SELECT ?, d",
+			args:  []any{int64(4), int64(5)},
+			want:  []any{int64(5), int64(4)},
+		},
+		{
+			name:  "declare_positional_extra",
+			query: "DECLARE d INT64 DEFAULT ?; SELECT ?",
+			args:  []any{int64(1), int64(2), int64(3)},
+			want:  []any{int64(2)},
+		},
+		{
+			name:  "declare_positional_string",
+			query: "DECLARE s STRING DEFAULT ?; SELECT s",
+			args:  []any{"hi"},
+			want:  []any{"hi"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make([]any, len(tc.want))
+			ptrs := make([]any, len(got))
+			for i := range got {
+				ptrs[i] = &got[i]
+			}
+			if err := db.QueryRowContext(ctx, tc.query, tc.args...).Scan(ptrs...); err != nil {
+				t.Fatalf("%s: %v", tc.query, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("%s: got %#v, want %#v", tc.query, got, tc.want)
+			}
+		})
+	}
+
+	// A DECLARE referencing a parameter the caller did not supply must
+	// fail rather than silently evaluate to NULL.
+	var v any
+	err = db.QueryRowContext(ctx, "DECLARE m INT64 DEFAULT @missing; SELECT m").Scan(&v)
+	if err == nil || !strings.Contains(err.Error(), "not enough query arguments") {
+		t.Fatalf("missing parameter: expected an error containing %q, got %v (value %v)", "not enough query arguments", err, v)
 	}
 }
