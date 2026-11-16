@@ -396,6 +396,36 @@ func TestScriptVariableParams(t *testing.T) {
 			args:  []any{sql.Named("start_date", int64(3))},
 			want:  []any{int64(6)},
 		},
+		{
+			name:  "trailing_line_comment_in_default",
+			query: "DECLARE tc1 INT64 DEFAULT @p -- note\n; SELECT tc1, 1",
+			args:  []any{sql.Named("p", int64(4))},
+			want:  []any{int64(4), int64(1)},
+		},
+		{
+			name:  "line_comment_in_type",
+			query: "DECLARE tc2 INT64 -- note\n DEFAULT @p; SELECT tc2, 1",
+			args:  []any{sql.Named("p", int64(4))},
+			want:  []any{int64(4), int64(1)},
+		},
+		{
+			name:  "trailing_hash_comment_in_default",
+			query: "DECLARE tc3 INT64 DEFAULT @p # note\n; SELECT tc3, 1",
+			args:  []any{sql.Named("p", int64(4))},
+			want:  []any{int64(4), int64(1)},
+		},
+		{
+			name:  "raw_string_with_escaped_quote_and_placeholder",
+			query: `DECLARE rs1 INT64 DEFAULT ?; SELECT 1, r'a\'?', rs1`,
+			args:  []any{int64(1)},
+			want:  []any{int64(1), `a\'?`, int64(1)},
+		},
+		{
+			name:  "raw_string_with_escaped_quote_and_semicolon",
+			query: `DECLARE rs2 STRING DEFAULT @p; SELECT 1, r'\';', rs2`,
+			args:  []any{sql.Named("p", "x")},
+			want:  []any{int64(1), `\';`, "x"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := make([]any, len(tc.want))

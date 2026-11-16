@@ -101,20 +101,33 @@ func applyScriptVariables(ctx context.Context, query string, conn *Conn) string 
 // scriptVariableValue returns the text a script variable assigned expr
 // is substituted with. A parameter-free expression is evaluated through
 // SQLite to a literal, which keeps repeated SET m = m + 1 from growing
-// the text quadratically. One that references a query parameter is kept as text, cast
-// to the declared type typ when there is one: SQLite would read the
-// parameter unbound (as NULL), and inlining the text lets the statement
-// that uses the variable bind the parameter by name, with its real type,
-// as often as the variable appears.
+// the text quadratically. One that references a query parameter is kept
+// as text, cast to the declared type typ when there is one: SQLite would
+// read the parameter unbound (as NULL), and inlining the text lets the
+// statement that uses the variable bind the parameter by name, with its
+// real type, as often as the variable appears.
+//
+// Known limitation: the inlined text is evaluated at each use rather
+// than once, so a subquery or volatile function (e.g. RAND()) in a
+// parameterized right-hand side can give a different value than in
+// BigQuery, which evaluates a DECLARE / SET once.
 func scriptVariableValue(ctx context.Context, conn *Conn, typ, expr string) string {
 	expr = substituteScriptVariables(expr, conn)
 	if !hasQueryParameter(expr) {
 		return evaluateScriptVariableExpr(ctx, conn, expr)
 	}
-	if typ != "" {
-		return "CAST((" + strings.TrimSpace(expr) + ") AS " + typ + ")"
+	// Comments are dropped because the text is wrapped and inlined: a
+	// trailing `-- note` would otherwise comment out the closing
+	// parenthesis and the rest of the using statement.
+	expr = strings.TrimSpace(stripComments(expr, true))
+	if typ = strings.TrimSpace(stripComments(typ, true)); typ != "" {
+		// CAST is more lenient than BigQuery's assignment coercion
+		// (e.g. it accepts a STRING for an INT64 variable), and a
+		// parameterized type such as NUMERIC(10, 2) or STRING(5) is not
+		// enforced.
+		return "CAST((" + expr + ") AS " + typ + ")"
 	}
-	return "(" + strings.TrimSpace(expr) + ")"
+	return "(" + expr + ")"
 }
 
 // hasQueryParameter reports whether expr references a named or
@@ -171,10 +184,20 @@ func applyScriptPositionalRewrite(query string, args []driver.NamedValue) (strin
 // stripLiteralsAndComments returns s with its string literals, quoted
 // identifiers and comments removed, so placeholders can be counted.
 func stripLiteralsAndComments(s string) string {
+	return stripComments(s, false)
+}
+
+// stripComments returns s with its comments replaced by a space, and
+// its string literals and quoted identifiers too unless keepLiterals.
+func stripComments(s string, keepLiterals bool) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		if end := skipLiteralOrComment(s, i); end > i {
-			b.WriteByte(' ')
+			if keepLiterals && s[i] != '-' && s[i] != '#' && s[i] != '/' {
+				b.WriteString(s[i:end])
+			} else {
+				b.WriteByte(' ')
+			}
 			i = end - 1
 			continue
 		}
@@ -261,9 +284,10 @@ func splitTopLevelStatements(query string) []string {
 // skipLiteralOrComment returns the byte index just past the string
 // literal, quoted identifier or comment that starts at s[i], or i when
 // none starts there. It handles single-, double- and triple-quoted
-// strings, raw strings (r'...', which have no escapes), backticked
-// identifiers, and `--`, `#` and `/* */` comments, so a `;`, `?` or
-// apostrophe inside any of them is not mistaken for code.
+// strings, backticked identifiers, and `--`, `#` and `/* */` comments,
+// so a `;`, `?` or apostrophe inside any of them is not mistaken for
+// code. A backslash always skips the next character: even a raw string
+// (r'a\'b') does not end at an escaped quote.
 func skipLiteralOrComment(s string, i int) int {
 	switch c := s[i]; {
 	case c == '-' && strings.HasPrefix(s[i:], "--"), c == '#':
@@ -277,21 +301,12 @@ func skipLiteralOrComment(s string, i int) int {
 		}
 		return len(s)
 	case c == '\'' || c == '"' || c == '`':
-		raw := false
-		for j := i - 1; j >= 0 && j >= i-2 && isIdentCont(s[j]); j-- {
-			if s[j] == 'r' || s[j] == 'R' {
-				raw = true
-			}
-		}
-		if raw && i >= 3 && isIdentCont(s[i-3]) {
-			raw = false // part of a longer identifier, not a prefix
-		}
 		quote := s[i : i+1]
 		if c != '`' && strings.HasPrefix(s[i:], strings.Repeat(quote, 3)) {
 			quote = strings.Repeat(quote, 3)
 		}
 		for j := i + len(quote); j < len(s); j++ {
-			if s[j] == '\\' && !raw {
+			if s[j] == '\\' {
 				j++
 				continue
 			}
