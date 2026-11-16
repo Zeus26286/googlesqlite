@@ -112,6 +112,14 @@ var enabledLanguageFeatures = []googlesql.LanguageFeature{
 	googlesql.LanguageFeatureFeatureCreateTablePartitionBy,
 	googlesql.LanguageFeatureFeatureCreateTableClusterBy,
 	googlesql.LanguageFeatureFeatureColumnDefaultValue,
+	// `CREATE TABLE ... LIKE`: the analyzer materializes the columns of
+	// the source table into the column list.
+	googlesql.LanguageFeatureFeatureCreateTableLike,
+	// ALTER TABLE ... RENAME COLUMN and ALTER COLUMN ... SET DATA TYPE.
+	// googlesqlite runs ALTER TABLE as a no-op, but the analyzer must
+	// accept every form so that a statement handler can run it.
+	googlesql.LanguageFeatureFeatureAlterTableRenameColumn,
+	googlesql.LanguageFeatureFeatureAlterColumnSetDataType,
 	// Function-set feature flags. Enable the families we have
 	// runtime support for so the analyzer recognises the new
 	// builtins (LAX_*, EDIT_DISTANCE, MAX_BY / MIN_BY, etc.)
@@ -1572,7 +1580,8 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 			ctx = a.context(ctx, funcMap, tvfMap)
 			ctx = withSystemVars(ctx, conn.systemVars)
 			ctx = withConn(ctx, conn)
-			action, err := a.newStmtAction(ctx, query, stmtArgs, stmtNode)
+			src := statementSource{sql: statementText(stmt, query), inScript: len(parsed.stmts) > 1}
+			action, err := a.newStmtAction(withStatementSource(ctx, src), query, stmtArgs, stmtNode)
 			if err != nil {
 				return nil, err
 			}
@@ -1778,6 +1787,27 @@ func (a *Analyzer) analyzeTemplatedFunctionWithRuntimeArgument(ctx context.Conte
 }
 
 func (a *Analyzer) newStmtAction(ctx context.Context, query string, args []driver.NamedValue, node googlesql.ResolvedStatementNode) (StmtAction, error) {
+	kind, _ := node.NodeKind()
+	hook := statementHookFor(kind)
+	if hook == nil {
+		return a.newBuiltinStmtAction(ctx, query, args, node)
+	}
+	src := statementSourceFromContext(ctx)
+	sql := src.sql
+	if sql == "" {
+		sql = query
+	}
+	return &handlerStmtAction{
+		hook: hook,
+		stmt: &HandlerStatement{Kind: kind, Node: node, SQL: sql, InScript: src.inScript},
+		builtin: func() (StmtAction, error) {
+			return a.newBuiltinStmtAction(ctx, query, args, node)
+		},
+	}, nil
+}
+
+// newBuiltinStmtAction returns the engine's own action for node.
+func (a *Analyzer) newBuiltinStmtAction(ctx context.Context, query string, args []driver.NamedValue, node googlesql.ResolvedStatementNode) (StmtAction, error) {
 	kind, _ := node.NodeKind()
 	switch kind {
 	case googlesql.ResolvedNodeKindResolvedCreateTableStmt:
