@@ -721,38 +721,29 @@ func applyMixedParameterRewrite(query string, args []driver.NamedValue) (string,
 			return query, args
 		}
 	}
+	return renamePositionalParams(query, args)
+}
+
+// renamePositionalParams renames every positional `?` placeholder to a
+// synthetic `@gsl_pos_<N>` (1-based, in order of appearance) and names
+// the positional args to match, in order. Placeholders inside string
+// literals, quoted identifiers and comments are left alone.
+func renamePositionalParams(query string, args []driver.NamedValue) (string, []driver.NamedValue) {
 	var b strings.Builder
 	b.Grow(len(query) + 16)
 	posCount := 0
-	i := 0
-	for i < len(query) {
-		c := query[i]
-		if c == '\'' || c == '"' {
-			end := scanStringLiteral(query, i)
+	for i := 0; i < len(query); i++ {
+		if end := skipLiteralOrComment(query, i); end > i {
 			b.WriteString(query[i:end])
-			i = end
+			i = end - 1
 			continue
 		}
-		if c == '`' {
-			end := i + 1
-			for end < len(query) && query[end] != '`' {
-				end++
-			}
-			if end < len(query) {
-				end++
-			}
-			b.WriteString(query[i:end])
-			i = end
-			continue
-		}
-		if c == '?' {
+		if query[i] == '?' {
 			posCount++
 			fmt.Fprintf(&b, "@gsl_pos_%d", posCount)
-			i++
 			continue
 		}
-		b.WriteByte(c)
-		i++
+		b.WriteByte(query[i])
 	}
 	if posCount == 0 {
 		return query, args
@@ -1527,6 +1518,10 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	// calls in their exact positions relative to the uniform pipeline
 	// steps.
 	query, args = applyMixedParameterRewrite(query, args)
+	query, args, err := applyScriptPositionalRewrite(query, args)
+	if err != nil {
+		return nil, err
+	}
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePreScriptVars)
 	query = applyScriptVariables(ctx, query, conn)
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePostScriptVars)

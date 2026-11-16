@@ -3,7 +3,11 @@ package googlesqlite_test
 import (
 	"context"
 	"database/sql"
+	"math"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestUnusedNamedParamIgnored checks that named parameters a statement
@@ -239,5 +243,224 @@ func TestPreparedStmtUnusedParams(t *testing.T) {
 	}()
 	if got := queryOne("SELECT COUNT(*) FROM up_p"); got != 1 {
 		t.Fatalf("COUNT(*): got %d, want 1", got)
+	}
+}
+
+// TestMissingUsedParamErrors checks that ignoring unused parameters does
+// not hide a parameter the statement uses but the caller did not supply.
+func TestMissingUsedParamErrors(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=unused_params_missing")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	var a, b any
+	err = db.QueryRowContext(ctx, "SELECT @a, @b", sql.Named("b", int64(1))).Scan(&a, &b)
+	if err == nil || !strings.Contains(err.Error(), "not enough query arguments") {
+		t.Fatalf("expected an error containing %q, got %v", "not enough query arguments", err)
+	}
+}
+
+// TestScriptVariableParams checks that query parameters on the
+// right-hand side of a DECLARE DEFAULT or SET are bound, with their real
+// types, wherever the variable is used, instead of evaluating to NULL.
+// Positional values bind in the order their `?` appears in the script,
+// ignoring any in comments.
+func TestScriptVariableParams(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=unused_params_script_vars")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sv_t (a INT64)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	ts := time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		query string
+		args  []any
+		want  []any
+	}{
+		{
+			name:  "declare_named",
+			query: "DECLARE x INT64 DEFAULT @p; SELECT x",
+			args:  []any{sql.Named("p", int64(4)), sql.Named("q", int64(1))},
+			want:  []any{int64(4)},
+		},
+		{
+			name:  "set_named",
+			query: "DECLARE x INT64 DEFAULT 1; SET x = @p; SELECT x",
+			args:  []any{sql.Named("p", int64(4))},
+			want:  []any{int64(4)},
+		},
+		{
+			name:  "set_named_repeated",
+			query: "DECLARE x INT64 DEFAULT @p; SET x = x + @p; SELECT x, @q",
+			args:  []any{sql.Named("p", int64(4)), sql.Named("q", int64(1))},
+			want:  []any{int64(8), int64(1)},
+		},
+		{
+			name:  "declare_named_string",
+			query: "DECLARE s STRING DEFAULT @s; SELECT s",
+			args:  []any{sql.Named("s", "a\\b\"c\nd'e")},
+			want:  []any{"a\\b\"c\nd'e"},
+		},
+		{
+			name:  "declare_positional",
+			query: "DECLARE d INT64 DEFAULT ?; SELECT d",
+			args:  []any{int64(4)},
+			want:  []any{int64(4)},
+		},
+		{
+			name:  "declare_positional_order",
+			query: "DECLARE d INT64 DEFAULT ?; SELECT ?, d",
+			args:  []any{int64(4), int64(5)},
+			want:  []any{int64(5), int64(4)},
+		},
+		{
+			name:  "declare_positional_extra",
+			query: "DECLARE d INT64 DEFAULT ?; SELECT ?",
+			args:  []any{int64(1), int64(2), int64(3)},
+			want:  []any{int64(2)},
+		},
+		{
+			name:  "declare_positional_string",
+			query: "DECLARE s STRING DEFAULT ?; SELECT s",
+			args:  []any{"hi"},
+			want:  []any{"hi"},
+		},
+		{
+			name:  "positional_after_block_comment",
+			query: "INSERT INTO sv_t (a) VALUES (?) /* ? */; DECLARE c1 INT64 DEFAULT ?; DECLARE c2 INT64 DEFAULT ?; SELECT c1, c2",
+			args:  []any{int64(1), int64(2), int64(3)},
+			want:  []any{int64(2), int64(3)},
+		},
+		{
+			name:  "positional_after_line_comment",
+			query: "INSERT INTO sv_t (a) VALUES (?) -- why? don't\n; -- why?\nDECLARE c3 INT64 DEFAULT ?; DECLARE c4 INT64 DEFAULT ?; SELECT c3, c4",
+			args:  []any{int64(1), int64(2), int64(3)},
+			want:  []any{int64(2), int64(3)},
+		},
+		{
+			name:  "positional_timestamp_then_int",
+			query: "DECLARE ts1 TIMESTAMP DEFAULT ?; DECLARE n1 INT64 DEFAULT ?; SELECT n1, UNIX_SECONDS(ts1)",
+			args:  []any{ts, int64(5)},
+			want:  []any{int64(5), ts.Unix()},
+		},
+		{
+			name:  "positional_timestamp_order",
+			query: "DECLARE ts2 TIMESTAMP DEFAULT ?; SELECT ?, UNIX_SECONDS(ts2)",
+			args:  []any{ts, int64(5)},
+			want:  []any{int64(5), ts.Unix()},
+		},
+		{
+			name:  "positional_used_twice",
+			query: "DECLARE u1 INT64 DEFAULT ?; SELECT u1, u1, u1 + ?",
+			args:  []any{int64(4), int64(1)},
+			want:  []any{int64(4), int64(4), int64(5)},
+		},
+		{
+			name:  "named_bool",
+			query: "DECLARE b1 BOOL DEFAULT @p; SELECT b1 AND TRUE",
+			args:  []any{sql.Named("p", true)},
+			want:  []any{true},
+		},
+		{
+			name:  "named_float_inf",
+			query: "DECLARE f1 FLOAT64 DEFAULT @f; SELECT f1",
+			args:  []any{sql.Named("f", math.Inf(1))},
+			want:  []any{math.Inf(1)},
+		},
+		{
+			name:  "named_int_into_float",
+			query: "DECLARE f3 FLOAT64 DEFAULT @i; SELECT f3",
+			args:  []any{sql.Named("i", int64(4))},
+			want:  []any{float64(4)},
+		},
+		{
+			name:  "string_reused_in_declare",
+			query: "DECLARE s1 STRING DEFAULT @s; DECLARE n2 INT64 DEFAULT LENGTH(s1); SELECT n2",
+			args:  []any{sql.Named("s", "\\\nb")},
+			want:  []any{int64(3)},
+		},
+		{
+			name:  "param_named_like_variable",
+			query: "DECLARE start_date INT64 DEFAULT @start_date; SELECT start_date + @start_date",
+			args:  []any{sql.Named("start_date", int64(3))},
+			want:  []any{int64(6)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make([]any, len(tc.want))
+			ptrs := make([]any, len(got))
+			for i := range got {
+				ptrs[i] = &got[i]
+			}
+			if err := db.QueryRowContext(ctx, tc.query, tc.args...).Scan(ptrs...); err != nil {
+				t.Fatalf("%s: %v", tc.query, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("%s: got %#v, want %#v", tc.query, got, tc.want)
+			}
+		})
+	}
+
+	// A NaN parameter must behave the same through a script variable as
+	// it does used directly. (SQLite binds NaN as NULL, so today both
+	// are NULL; comparing keeps this test right if that changes.)
+	var direct, viaVar any
+	nan := sql.Named("f", math.NaN())
+	if err := db.QueryRowContext(ctx, "SELECT IS_NAN(@f)", nan).Scan(&direct); err != nil {
+		t.Fatalf("NaN direct: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "DECLARE f2 FLOAT64 DEFAULT @f; SELECT IS_NAN(f2)", nan).Scan(&viaVar); err != nil {
+		t.Fatalf("NaN via variable: %v", err)
+	}
+	if !reflect.DeepEqual(direct, viaVar) {
+		t.Fatalf("NaN: via variable got %#v, used directly got %#v", viaVar, direct)
+	}
+
+	// A DECLARE referencing a parameter the caller did not supply must
+	// fail rather than silently evaluate to NULL.
+	var v any
+	err = db.QueryRowContext(ctx, "DECLARE m INT64 DEFAULT @missing; SELECT m").Scan(&v)
+	if err == nil || !strings.Contains(err.Error(), "not enough query arguments") {
+		t.Fatalf("missing parameter: expected an error containing %q, got %v (value %v)", "not enough query arguments", err, v)
+	}
+}
+
+// TestPreparedScriptVariablePositionalParamErrors checks that a prepared
+// script with a positional parameter in a DECLARE is rejected. Its
+// placeholder is inlined where the variable is used, and a prepared
+// statement binds values in the order its own placeholders appear, so
+// binding it would put the values in the wrong order.
+func TestPreparedScriptVariablePositionalParamErrors(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=unused_params_prepared_script_vars")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("Conn: %v", err)
+	}
+	defer conn.Close()
+
+	stmt, err := conn.PrepareContext(ctx, "DECLARE pd INT64 DEFAULT ?; SELECT ?, pd")
+	if err == nil {
+		stmt.Close()
+		t.Fatal("expected an error preparing a positional parameter in DECLARE, got nil")
+	}
+	if want := "not supported in prepared statements"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected an error containing %q, got %v", want, err)
 	}
 }
