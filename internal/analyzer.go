@@ -1931,7 +1931,9 @@ func (a *noopStmtAction) Cleanup(ctx context.Context, conn *Conn) error { return
 
 func (a *Analyzer) newCreateTableStmtAction(ctx context.Context, query string, args []driver.NamedValue, node *googlesql.ResolvedCreateTableStmt) (*CreateTableStmtAction, error) {
 	spec := newTableSpecWithQuery(ctx, a.namePath, query, node)
-	queryArgs, err := getArgsFromParams(args, nil)
+	// The CREATE TABLE schema SQL never contains placeholders, so bind
+	// no arguments even when the caller supplied (unused) parameters.
+	queryArgs, err := getArgsFromParams(args, []*googlesql.ResolvedParameter{})
 	if err != nil {
 		return nil, err
 	}
@@ -2939,12 +2941,10 @@ func getArgsFromParams(values []driver.NamedValue, params []*googlesql.ResolvedP
 	if values == nil {
 		return nil, nil
 	}
-	// The resolved-tree walker is a placeholder while ResolvedNode
-	// child iteration isn't yet bridged, so params may be empty even
-	// when the user supplied real parameters. In that case pass the
-	// named values straight through and let SQLite handle native
-	// @name / ? binding.
-	if len(params) == 0 && len(values) > 0 {
+	// A nil params slice means the caller did not collect parameters
+	// for this statement, so pass the named values straight through and
+	// let SQLite handle native @name / ? binding.
+	if params == nil {
 		out := make([]any, 0, len(values))
 		for _, v := range values {
 			// Conn.CheckNamedValue has already encoded each value
@@ -2958,6 +2958,13 @@ func getArgsFromParams(values []driver.NamedValue, params []*googlesql.ResolvedP
 			}
 		}
 		return out, nil
+	}
+	// A non-nil empty params slice means the statement has no
+	// parameters, so the formatted SQL has no placeholders and nothing
+	// is bound. BigQuery ignores unused query parameters, whereas SQLite
+	// would reject the statement for receiving unexpected arguments.
+	if len(params) == 0 {
+		return nil, nil
 	}
 	argNum := len(params)
 	if len(values) < argNum {

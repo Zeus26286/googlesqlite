@@ -17,16 +17,6 @@ var (
 	_ driver.Stmt = &QueryStmt{}
 )
 
-// encodeOrPassArgs wraps EncodeGoValues with a fall-through: when the
-// resolved-AST walker failed to populate params (current bridge limitation),
-// s.args is empty even though the caller passed real arguments. In that
-// case we hand the raw values to SQLite directly — its driver handles
-// @name / ? native binding for primitive types.
-//
-// TODO: once ResolvedNode.ChildrenAccept is bridged and
-// getParamsFromNode returns a full list, this fallback can go away and
-// EncodeGoValues alone will type-check each argument against the
-// googlesql-inferred type.
 // CheckNamedValue is the canonical CheckNamedValue used by Conn,
 // DMLStmt, and QueryStmt. It encodes the value into the googlesqlite
 // layout so the underlying SQLite driver only ever sees primitive
@@ -45,14 +35,32 @@ func CheckNamedValue(value *driver.NamedValue) error {
 	return nil
 }
 
+// encodeOrPassArgs encodes the arguments of a prepared statement against
+// the parameters the analyzer collected from it. A nil params slice means
+// the caller did not collect parameters, so the values are handed to
+// SQLite unchanged and its driver handles @name / ? native binding. A
+// non-nil empty slice means the statement has no parameters at all, so no
+// arguments are bound: BigQuery ignores unused query parameters, and
+// binding them would make SQLite reject the statement. Extra positional
+// arguments beyond the collected parameters are dropped for the same
+// reason, mirroring getArgsFromParams.
 func encodeOrPassArgs(values []any, params []*googlesql.ResolvedParameter) ([]any, error) {
-	if len(params) == 0 && len(values) > 0 {
+	if params == nil {
+		if len(values) == 0 {
+			return nil, nil
+		}
 		// Conn.CheckNamedValue has already encoded each value into
 		// the canonical googlesqlite layout. Pass through unchanged
 		// — re-encoding here would double-wrap the value.
 		out := make([]any, len(values))
 		copy(out, values)
 		return out, nil
+	}
+	if len(params) == 0 {
+		return nil, nil
+	}
+	if len(values) > len(params) {
+		values = values[:len(params)]
 	}
 	return EncodeGoValues(values, params)
 }
