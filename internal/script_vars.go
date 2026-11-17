@@ -2,6 +2,8 @@ package internal
 
 import (
 	"context"
+	"database/sql/driver"
+	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
@@ -51,6 +53,12 @@ func formatScriptFloat(v float64) string {
 //
 // Substitutions appear in the rewritten SQL parenthesised so binary
 // expressions like `id = x` survive when x is e.g. `1 + 2`.
+//
+// A right-hand side that references a query parameter is not evaluated:
+// its text is stored instead (cast to the declared type, if any), so the
+// statement that uses the variable binds the parameter with its real
+// type. applyScriptPositionalRewrite has already renamed any positional
+// `?` there to a named parameter.
 func applyScriptVariables(ctx context.Context, query string, conn *Conn) string {
 	if conn == nil {
 		return query
@@ -61,23 +69,19 @@ func applyScriptVariables(ctx context.Context, query string, conn *Conn) string 
 	}
 	var keep []string
 	for _, stmt := range stmts {
-		trimmed := strings.TrimSpace(stmt)
+		trimmed := trimLeadingComments(stmt)
 		if trimmed == "" {
 			continue
 		}
-		if name, expr, ok := parseDeclare(trimmed); ok {
-			// Substitute any earlier-declared variables on the RHS,
-			// evaluate the result through SQLite to a concrete
-			// literal, and store the literal. This keeps repeated
-			// SET m = m + 1 from growing the text quadratically.
-			lit := evaluateScriptVariableExpr(ctx, conn, substituteScriptVariables(expr, conn))
-			conn.SetScriptVariable(name, lit)
+		if name, typ, expr, ok := parseDeclare(trimmed); ok {
+			// Substitute any earlier-declared variables on the RHS
+			// and store its value; see scriptVariableValue.
+			conn.SetScriptVariable(name, scriptVariableValue(ctx, conn, typ, expr))
 			continue
 		}
 		if name, expr, ok := parseAssignment(trimmed); ok {
 			if _, declared := conn.ScriptVariable(name); declared {
-				lit := evaluateScriptVariableExpr(ctx, conn, substituteScriptVariables(expr, conn))
-				conn.SetScriptVariable(name, lit)
+				conn.SetScriptVariable(name, scriptVariableValue(ctx, conn, "", expr))
 				continue
 			}
 			// Not a declared variable — fall through (handled by
@@ -92,6 +96,125 @@ func applyScriptVariables(ctx context.Context, query string, conn *Conn) string 
 		return "SELECT 1"
 	}
 	return strings.Join(keep, "; ")
+}
+
+// scriptVariableValue returns the text a script variable assigned expr
+// is substituted with. A parameter-free expression is evaluated through
+// SQLite to a literal, which keeps repeated SET m = m + 1 from growing
+// the text quadratically. One that references a query parameter is kept
+// as text, cast to the declared type typ when there is one: SQLite would
+// read the parameter unbound (as NULL), and inlining the text lets the
+// statement that uses the variable bind the parameter by name, with its
+// real type, as often as the variable appears.
+//
+// Known limitation: the inlined text is evaluated at each use rather
+// than once, so a subquery or volatile function (e.g. RAND()) in a
+// parameterized right-hand side can give a different value than in
+// BigQuery, which evaluates a DECLARE / SET once.
+func scriptVariableValue(ctx context.Context, conn *Conn, typ, expr string) string {
+	expr = substituteScriptVariables(expr, conn)
+	if !hasQueryParameter(expr) {
+		return evaluateScriptVariableExpr(ctx, conn, expr)
+	}
+	// Comments are dropped because the text is wrapped and inlined: a
+	// trailing `-- note` would otherwise comment out the closing
+	// parenthesis and the rest of the using statement.
+	expr = strings.TrimSpace(stripComments(expr, true))
+	if typ = strings.TrimSpace(stripComments(typ, true)); typ != "" {
+		// CAST is more lenient than BigQuery's assignment coercion
+		// (e.g. it accepts a STRING for an INT64 variable), and a
+		// parameterized type such as NUMERIC(10, 2) or STRING(5) is not
+		// enforced.
+		return "CAST((" + expr + ") AS " + typ + ")"
+	}
+	return "(" + expr + ")"
+}
+
+// hasQueryParameter reports whether expr references a named or
+// positional query parameter outside literals and comments. `@@name`
+// system variables do not count.
+func hasQueryParameter(expr string) bool {
+	code := strings.ReplaceAll(stripLiteralsAndComments(expr), "@@", "")
+	return strings.ContainsAny(code, "?@")
+}
+
+// applyScriptPositionalRewrite renames every positional `?` in a script
+// to a named parameter, and names the positional args to match, when a
+// DECLARE DEFAULT / SET right-hand side uses one. applyScriptVariables
+// inlines such a right-hand side wherever the variable is used, so its
+// placeholder must bind by name rather than by position. Positional
+// parameters bind in the order they appear in the script, which the
+// renaming preserves.
+//
+// A prepared statement has no args yet, and binds its values in the
+// order its own placeholders appear, which would no longer match, so
+// that case (like any call with too few values) is rejected.
+func applyScriptPositionalRewrite(query string, args []driver.NamedValue) (string, []driver.NamedValue, error) {
+	usesPositional := false
+	for _, stmt := range splitTopLevelStatements(query) {
+		stmt = trimLeadingComments(stmt)
+		_, _, expr, ok := parseDeclare(stmt)
+		if !ok {
+			_, expr, ok = parseAssignment(stmt)
+		}
+		if ok && strings.Contains(stripLiteralsAndComments(expr), "?") {
+			usesPositional = true
+			break
+		}
+	}
+	if !usesPositional {
+		return query, args, nil
+	}
+	nPositional := 0
+	for _, v := range args {
+		if v.Name == "" {
+			nPositional++
+		}
+	}
+	if want := strings.Count(stripLiteralsAndComments(query), "?"); nPositional < want {
+		if len(args) == 0 {
+			return "", nil, fmt.Errorf("not enough query arguments: positional parameters in DECLARE or SET are not supported in prepared statements")
+		}
+		return "", nil, fmt.Errorf("not enough query arguments")
+	}
+	query, args = renamePositionalParams(query, args)
+	return query, args, nil
+}
+
+// stripLiteralsAndComments returns s with its string literals, quoted
+// identifiers and comments removed, so placeholders can be counted.
+func stripLiteralsAndComments(s string) string {
+	return stripComments(s, false)
+}
+
+// stripComments returns s with its comments replaced by a space, and
+// its string literals and quoted identifiers too unless keepLiterals.
+func stripComments(s string, keepLiterals bool) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if end := skipLiteralOrComment(s, i); end > i {
+			if keepLiterals && s[i] != '-' && s[i] != '#' && s[i] != '/' {
+				b.WriteString(s[i:end])
+			} else {
+				b.WriteByte(' ')
+			}
+			i = end - 1
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// trimLeadingComments strips leading whitespace and comments from stmt.
+func trimLeadingComments(stmt string) string {
+	for {
+		stmt = strings.TrimLeftFunc(stmt, unicode.IsSpace)
+		if !strings.HasPrefix(stmt, "--") && !strings.HasPrefix(stmt, "#") && !strings.HasPrefix(stmt, "/*") {
+			return strings.TrimSpace(stmt)
+		}
+		stmt = stmt[skipLiteralOrComment(stmt, 0):]
+	}
 }
 
 // evaluateScriptVariableExpr asks the underlying SQLite to compute
@@ -143,12 +266,11 @@ func splitTopLevelStatements(query string) []string {
 	var stmts []string
 	start := 0
 	for i := 0; i < len(query); i++ {
-		c := query[i]
-		switch c {
-		case '\'', '"', '`':
-			end := scanQuoted(query, i, c)
+		if end := skipLiteralOrComment(query, i); end > i {
 			i = end - 1
-		case ';':
+			continue
+		}
+		if query[i] == ';' {
 			stmts = append(stmts, query[start:i])
 			start = i + 1
 		}
@@ -159,39 +281,58 @@ func splitTopLevelStatements(query string) []string {
 	return stmts
 }
 
-// scanQuoted returns the byte index past the closing quote at
-// query[start]. Bare backslash escapes are honoured for ' and ";
-// backticks have no escape mechanism but tolerate doubled “ to
-// embed a backtick.
-func scanQuoted(query string, start int, quote byte) int {
-	i := start + 1
-	for i < len(query) {
-		c := query[i]
-		if c == '\\' && quote != '`' && i+1 < len(query) {
-			i += 2
-			continue
+// skipLiteralOrComment returns the byte index just past the string
+// literal, quoted identifier or comment that starts at s[i], or i when
+// none starts there. It handles single-, double- and triple-quoted
+// strings, backticked identifiers, and `--`, `#` and `/* */` comments,
+// so a `;`, `?` or apostrophe inside any of them is not mistaken for
+// code. A backslash always skips the next character: even a raw string
+// (r'a\'b') does not end at an escaped quote.
+func skipLiteralOrComment(s string, i int) int {
+	switch c := s[i]; {
+	case c == '-' && strings.HasPrefix(s[i:], "--"), c == '#':
+		if end := strings.IndexByte(s[i:], '\n'); end >= 0 {
+			return i + end
 		}
-		if c == quote {
-			return i + 1
+		return len(s)
+	case c == '/' && strings.HasPrefix(s[i:], "/*"):
+		if end := strings.Index(s[i+2:], "*/"); end >= 0 {
+			return i + 2 + end + 2
 		}
-		i++
+		return len(s)
+	case c == '\'' || c == '"' || c == '`':
+		quote := s[i : i+1]
+		if c != '`' && strings.HasPrefix(s[i:], strings.Repeat(quote, 3)) {
+			quote = strings.Repeat(quote, 3)
+		}
+		for j := i + len(quote); j < len(s); j++ {
+			if s[j] == '\\' {
+				j++
+				continue
+			}
+			if strings.HasPrefix(s[j:], quote) {
+				return j + len(quote)
+			}
+		}
+		return len(s)
 	}
-	return len(query)
+	return i
 }
 
 // parseDeclare matches `DECLARE name [type] [DEFAULT expr]` and
-// returns the (lower-cased) identifier and the DEFAULT expr text.
+// returns the (lower-cased) identifier, the type text ("" when absent
+// or when the list form makes it ambiguous) and the DEFAULT expr text.
 // Returns ok=false when the statement is not a DECLARE we can
 // handle.
-func parseDeclare(stmt string) (name, expr string, ok bool) {
+func parseDeclare(stmt string) (name, typ, expr string, ok bool) {
 	rest, hasKW := matchKeyword(stmt, "DECLARE")
 	if !hasKW {
-		return "", "", false
+		return "", "", "", false
 	}
 	rest = strings.TrimLeftFunc(rest, unicode.IsSpace)
 	identEnd := scanIdent(rest)
 	if identEnd == 0 {
-		return "", "", false
+		return "", "", "", false
 	}
 	name = strings.ToLower(rest[:identEnd])
 	rest = rest[identEnd:]
@@ -201,15 +342,18 @@ func parseDeclare(stmt string) (name, expr string, ok bool) {
 	defaultIdx := indexOfKeyword(rest, "DEFAULT")
 	if defaultIdx < 0 {
 		// No DEFAULT — start the variable as NULL.
-		return name, "NULL", true
+		return name, "", "NULL", true
+	}
+	if typ = strings.TrimSpace(rest[:defaultIdx]); strings.HasPrefix(typ, ",") {
+		typ = ""
 	}
 	expr = strings.TrimSpace(rest[defaultIdx+len("DEFAULT"):])
 	expr = strings.TrimSuffix(expr, ";")
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
-		return name, "NULL", true
+		return name, typ, "NULL", true
 	}
-	return name, expr, true
+	return name, typ, expr, true
 }
 
 // parseAssignment matches `SET name = expr` for non-@@ targets.
@@ -255,9 +399,7 @@ func substituteScriptVariables(stmt string, conn *Conn) string {
 	i := 0
 	for i < len(stmt) {
 		c := stmt[i]
-		switch c {
-		case '\'', '"', '`':
-			end := scanQuoted(stmt, i, c)
+		if end := skipLiteralOrComment(stmt, i); end > i {
 			b.WriteString(stmt[i:end])
 			i = end
 			continue
@@ -282,6 +424,13 @@ func substituteScriptVariables(stmt string, conn *Conn) string {
 				j++
 			}
 			word := stmt[i:j]
+			// A name right after `@` or `@@` is a query parameter or a
+			// system variable, never a script variable.
+			if i > 0 && stmt[i-1] == '@' {
+				b.WriteString(word)
+				i = j
+				continue
+			}
 			if expr, ok := conn.ScriptVariable(strings.ToLower(word)); ok {
 				// Don't substitute when followed by `(` — that would
 				// rewrite a function call whose name happens to
@@ -329,12 +478,11 @@ func matchKeyword(stmt, kw string) (string, bool) {
 // literals. Returns -1 when absent.
 func indexOfKeyword(s, kw string) int {
 	for i := 0; i < len(s); {
-		c := s[i]
-		switch c {
-		case '\'', '"', '`':
-			i = scanQuoted(s, i, c)
+		if end := skipLiteralOrComment(s, i); end > i {
+			i = end
 			continue
 		}
+		c := s[i]
 		if isIdentStart(c) {
 			j := i + 1
 			for j < len(s) && isIdentCont(s[j]) {
