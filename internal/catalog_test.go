@@ -1,8 +1,10 @@
 package internal
 
 import (
+	"slices"
 	"testing"
 
+	googlesql "github.com/goccy/go-googlesql"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -58,5 +60,48 @@ func TestNormalizeTablePath(t *testing.T) {
 				t.Errorf("normalizeTablePath(%v) mismatch (-want +got):\n%s", tt.input, diff)
 			}
 		})
+	}
+}
+
+// TestSubCatalogsHoldNoBuiltins guards against copying the builtin
+// function library into the project / dataset sub-catalogs a table
+// path creates. Each copy costs about 1 MiB of wasm heap, and a
+// consumer that creates a dataset per query job (such as a BigQuery
+// emulator writing job results into anonymous datasets) grows the
+// heap with every job until the 32-bit wasm address space runs out.
+func TestSubCatalogsHoldNoBuiltins(t *testing.T) {
+	c := NewCatalog(nil)
+	spec := &TableSpec{
+		NamePath: []string{"proj", "ds", "tbl"},
+		Columns: []*ColumnSpec{
+			{Name: "id", Type: &Type{Kind: int(googlesql.TypeKindTypeInt64)}},
+		},
+	}
+	if err := c.addTableSpec(spec); err != nil {
+		t.Fatalf("addTableSpec: %v", err)
+	}
+	var subs int
+	for _, children := range c.subCatalogs {
+		for name, sub := range children {
+			subs++
+			funcs, err := sub.FunctionNames()
+			if err != nil {
+				t.Fatalf("sub-catalog %q: FunctionNames: %v", name, err)
+			}
+			if len(funcs) != 0 {
+				t.Errorf("sub-catalog %q holds %d functions, want 0 (first: %q)", name, len(funcs), funcs[0])
+			}
+		}
+	}
+	if subs == 0 {
+		t.Fatal("addTableSpec created no sub-catalogs")
+	}
+	// The table must still resolve through the sub-catalogs.
+	names, err := c.getOrCreateSubCatalog(c.getOrCreateSubCatalog(c.catalog, "proj"), "ds").TableNames()
+	if err != nil {
+		t.Fatalf("proj.ds sub-catalog: TableNames: %v", err)
+	}
+	if !slices.Contains(names, "tbl") {
+		t.Fatalf("proj.ds sub-catalog tables = %v, want them to include tbl", names)
 	}
 }

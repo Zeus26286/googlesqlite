@@ -1674,8 +1674,16 @@ func (c *Catalog) getOrCreateSubCatalog(parent *googlesql.SimpleCatalog, name st
 	if existing, ok := subs[name]; ok {
 		return existing
 	}
-	sub := newSimpleCatalog(name)
-	if sub == nil {
+	// A sub-catalog only holds the user tables, functions and TVFs
+	// aliased into it, so build a bare SimpleCatalog instead of going
+	// through newSimpleCatalog. The analyzer resolves builtins from the
+	// root catalog; copying the full builtin library into every project
+	// / dataset / INFORMATION_SCHEMA sub-catalog costs about 1 MiB of
+	// wasm heap each. Every BigQuery query job writes its result into a
+	// fresh anonymous dataset, so that cost grew with every job until
+	// the 32-bit wasm address space ran out.
+	sub, err := googlesql.NewSimpleCatalog(name, tf())
+	if err != nil || sub == nil {
 		return nil
 	}
 	_ = parent.AddCatalog(sub)
