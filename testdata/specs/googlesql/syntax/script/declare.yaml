@@ -8,3 +8,43 @@ cases:
     expected:
       rows:
         - [42]
+  # Upstream example: "initializes the variable x as an INT64 with the
+  # value NULL".
+  - desc: DECLARE without DEFAULT initializes the variable to NULL
+    setup:
+      - DECLARE x INT64
+    sql: SELECT x
+    expected:
+      rows:
+        - [null]
+  # Upstream example: "initializes the variable d as a DATE object with
+  # the value of the current date".
+  - desc: DECLARE with a DEFAULT expression of CURRENT_DATE()
+    setup:
+      - DECLARE d DATE DEFAULT CURRENT_DATE()
+    sql: SELECT d = CURRENT_DATE()
+    expected:
+      rows:
+        - [true]
+  # Upstream example: "initializes the variables x, y, and z as INT64
+  # with the value 0".
+  - desc: DECLARE of several variables with one type and DEFAULT
+    setup:
+      - DECLARE x, y, z INT64 DEFAULT 0
+    sql: SELECT x, y, z
+    expected:
+      rows:
+        - [0, 0, 0]
+  # Upstream example: "declares a variable named item corresponding to
+  # an arbitrary item in the schema1.products table. The type of item is
+  # inferred from the table schema." The table holds a single item so
+  # the arbitrary item is deterministic.
+  - desc: DECLARE with the type inferred from a scalar subquery
+    setup:
+      - CREATE TABLE schema1.products (item STRING)
+      - INSERT INTO schema1.products (item) VALUES ('widget')
+      - DECLARE item DEFAULT (SELECT item FROM schema1.products LIMIT 1)
+    sql: SELECT item
+    expected:
+      rows:
+        - ["widget"]

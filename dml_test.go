@@ -1456,3 +1456,261 @@ LANGUAGE js AS """
 		}
 	})
 }
+
+// TestScriptVariableResolution covers how script variables resolve
+// against the rest of a statement. Variable references are resolved by
+// the analyzer: a name that is an alias, a column, a table or a struct
+// field is never replaced by a variable's value, and a column of the
+// same name as a variable takes precedence over the variable.
+//
+// Reference: docs/third_party/googlesql-docs/procedural-language.md
+// (DECLARE / SET; the SET example assigns SUM(word_count) from the
+// word_count column while a word_count variable is declared).
+func TestScriptVariableResolution(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		setup []string
+		query string
+		want  [][]any
+	}{
+		{
+			name:  "alias named like the variable",
+			query: "DECLARE x INT64 DEFAULT 0; SELECT 1 AS x",
+			want:  [][]any{{int64(1)}},
+		},
+		{
+			name:  "variable selected under its own name",
+			query: "DECLARE x INT64 DEFAULT 3; SELECT x AS x",
+			want:  [][]any{{int64(3)}},
+		},
+		{
+			name:  "subquery column named like the variable",
+			query: "DECLARE x INT64 DEFAULT 0; SELECT x FROM (SELECT 5 AS x)",
+			want:  [][]any{{int64(5)}},
+		},
+		{
+			name:  "qualified column named like the variable",
+			query: "DECLARE x INT64 DEFAULT 0; SELECT t.x FROM (SELECT 5 AS x) t",
+			want:  [][]any{{int64(5)}},
+		},
+		{
+			name:  "UNNEST alias named like the variable",
+			query: "DECLARE x INT64 DEFAULT 0; SELECT x FROM UNNEST([1, 2]) AS x ORDER BY x",
+			want:  [][]any{{int64(1)}, {int64(2)}},
+		},
+		{
+			name:  "variable compared with a column",
+			setup: []string{"CREATE TABLE sv_t1 (id INT64)", "INSERT INTO sv_t1 (id) VALUES (1), (5)"},
+			query: "DECLARE last_id INT64 DEFAULT 0; SET last_id = (SELECT MAX(id) FROM sv_t1); SELECT id FROM sv_t1 WHERE id = last_id",
+			want:  [][]any{{int64(5)}},
+		},
+		{
+			name:  "SET from a subquery with an alias named like the variable",
+			setup: []string{"CREATE TABLE sv_t2 (id INT64)", "INSERT INTO sv_t2 (id) VALUES (1), (5)"},
+			query: "DECLARE last_id INT64 DEFAULT 0; SET last_id = (SELECT MAX(id) AS last_id FROM sv_t2); SELECT last_id AS last_id",
+			want:  [][]any{{int64(5)}},
+		},
+		{
+			name:  "column takes precedence over a variable of the same name",
+			setup: []string{"CREATE TABLE sv_t3 (id INT64, last_id INT64)", "INSERT INTO sv_t3 (id, last_id) VALUES (1, 10), (5, 50)"},
+			query: "DECLARE last_id INT64 DEFAULT 0; SET last_id = (SELECT MAX(last_id) FROM sv_t3); SELECT last_id",
+			want:  [][]any{{int64(50)}},
+		},
+		{
+			name:  "SET sees rows written earlier in the same script",
+			setup: []string{"CREATE TABLE sv_t4 (id INT64)"},
+			query: "DECLARE n INT64 DEFAULT 0; INSERT INTO sv_t4 (id) VALUES (7); SET n = (SELECT COUNT(*) FROM sv_t4); SELECT n",
+			want:  [][]any{{int64(1)}},
+		},
+		{
+			name:  "SET re-evaluates nothing later",
+			setup: []string{"CREATE TABLE sv_t5 (id INT64)", "INSERT INTO sv_t5 (id) VALUES (1)"},
+			query: "DECLARE n INT64; SET n = (SELECT COUNT(*) FROM sv_t5); INSERT INTO sv_t5 (id) VALUES (2); SELECT n",
+			want:  [][]any{{int64(1)}},
+		},
+		{
+			name:  "field access named like the variable",
+			query: "DECLARE a INT64 DEFAULT 9; SELECT s.a FROM (SELECT STRUCT(1 AS a) AS s)",
+			want:  [][]any{{int64(1)}},
+		},
+		{
+			name:  "variable keeps its declared type",
+			query: "DECLARE f FLOAT64 DEFAULT 1; SET f = 3; SELECT f / 2",
+			want:  [][]any{{float64(1.5)}},
+		},
+		{
+			name:  "type inferred from DEFAULT",
+			query: "DECLARE d DEFAULT DATE '2024-02-29'; SELECT DATE_ADD(d, INTERVAL 1 DAY) = DATE '2024-03-01'",
+			want:  [][]any{{true}},
+		},
+		{
+			name:  "ARRAY variable",
+			query: "DECLARE arr DEFAULT [1, 2, 3]; SELECT ARRAY_LENGTH(arr), arr[OFFSET(2)]",
+			want:  [][]any{{int64(3), int64(3)}},
+		},
+		{
+			name:  "STRUCT variable",
+			query: "DECLARE s DEFAULT STRUCT(1 AS a, 'x' AS b); SELECT s.a, s.b",
+			want:  [][]any{{int64(1), "x"}},
+		},
+		{
+			name:  "multiple variables in one DECLARE",
+			query: "DECLARE x, y, z INT64 DEFAULT 0; SET y = 2; SELECT x, y, z",
+			want:  [][]any{{int64(0), int64(2), int64(0)}},
+		},
+		{
+			name:  "SET of several variables from a struct",
+			query: "DECLARE a INT64; DECLARE b STRING; DECLARE c BOOL; SET (a, b, c) = (1 + 3, 'foo', false); SELECT a, b, c",
+			want:  [][]any{{int64(4), "foo", false}},
+		},
+		{
+			name:  "non-finite FLOAT64 literal",
+			query: "SELECT CAST('inf' AS FLOAT64), CAST('-inf' AS FLOAT64)",
+			want:  [][]any{{math.Inf(1), math.Inf(-1)}},
+		},
+		{
+			name:  "non-finite FLOAT64 variable",
+			query: "DECLARE f FLOAT64 DEFAULT CAST('-inf' AS FLOAT64); SELECT f",
+			want:  [][]any{{math.Inf(-1)}},
+		},
+		{
+			name:  "variable names are case-insensitive",
+			query: "DECLARE Last_Id INT64 DEFAULT 4; SELECT LAST_ID",
+			want:  [][]any{{int64(4)}},
+		},
+		{
+			name:  "string with quotes and newline",
+			query: "DECLARE s STRING DEFAULT 'it\\'s \"q\"\\n'; SELECT s",
+			want:  [][]any{{"it's \"q\"\n"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db, err := sql.Open("googlesqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			ctx := context.Background()
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			for _, q := range tc.setup {
+				if _, err := conn.ExecContext(ctx, q); err != nil {
+					t.Fatalf("setup %q: %v", q, err)
+				}
+			}
+			rows, err := conn.QueryContext(ctx, tc.query)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			defer rows.Close()
+			cols, err := rows.Columns()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got [][]any
+			for rows.Next() {
+				row := make([]any, len(cols))
+				ptrs := make([]any, len(cols))
+				for i := range row {
+					ptrs[i] = &row[i]
+				}
+				if err := rows.Scan(ptrs...); err != nil {
+					t.Fatal(err)
+				}
+				got = append(got, row)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestScriptVariableDoesNotShadowLaterColumns checks that a variable
+// kept on the connection after a script does not replace a column of
+// the same name in a later query.
+func TestScriptVariableDoesNotShadowLaterColumns(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, q := range []string{
+		"CREATE TABLE svl_t (id INT64, last_id INT64)",
+		"INSERT INTO svl_t (id, last_id) VALUES (1, 10), (5, 50)",
+		"DECLARE last_id INT64 DEFAULT 5",
+	} {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	rows, err := conn.QueryContext(ctx, "SELECT last_id FROM svl_t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{10, 50}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	// The variable is still readable where no column shadows it.
+	var v int64
+	if err := conn.QueryRowContext(ctx, "SELECT last_id").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != 5 {
+		t.Fatalf("last_id = %d, want 5", v)
+	}
+}
+
+// TestScriptVariableErrors covers the errors GoogleSQL defines for
+// script variables.
+func TestScriptVariableErrors(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, query, want string
+	}{
+		{"redeclared in one script", "DECLARE x INT64; DECLARE x INT64; SELECT 1", "already declared"},
+		{"SET of an undeclared variable", "SET never_declared_v = 1", "Undeclared variable"},
+		{"SET of several from a non-struct", "DECLARE a INT64; DECLARE b INT64; SET (a, b) = (SELECT 1)", "STRUCT with 2 fields"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db, err := sql.Open("googlesqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			_, err = db.ExecContext(context.Background(), tc.query)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got error %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}

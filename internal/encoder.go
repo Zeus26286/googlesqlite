@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"regexp"
@@ -89,6 +90,18 @@ func literalFromValue(v value.Value) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		switch {
+		case math.IsInf(f64, 1):
+			// SQLite has no infinity literal; an overflowing one
+			// reads as +Inf.
+			return "9e999", nil
+		case math.IsInf(f64, -1):
+			return "-9e999", nil
+		case math.IsNaN(f64):
+			// SQLite REAL cannot hold NaN; it binds a NaN parameter
+			// as NULL too.
+			return "null", nil
+		}
 		value := strconv.FormatFloat(f64, 'g', -1, 64)
 		if !strings.Contains(value, ".") && !strings.Contains(value, "e") {
 			// append x.0 suffix to keep float value context
@@ -132,8 +145,25 @@ func valueFromGoogleSQLValue(v googlesql.Value) (value.Value, error) {
 		return intValueFromLiteral(m1(v.GetSQLLiteral()))
 	case googlesql.TypeKindTypeBool:
 		return boolValueFromLiteral(m1(v.GetSQLLiteral()))
-	case googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
-		return floatValueFromLiteral(m1(v.GetSQLLiteral()))
+	case googlesql.TypeKindTypeFloat:
+		// The SQL literal keeps the decimal form of a finite FLOAT32
+		// (0.1 rather than 0.10000000149011612). A non-finite value's
+		// literal is `CAST("inf" AS FLOAT32)`, which does not parse as
+		// a number, so read the value itself then.
+		if v, err := floatValueFromLiteral(m1(v.GetSQLLiteral())); err == nil {
+			return v, nil
+		}
+		f, err := v.FloatValue()
+		if err != nil {
+			return nil, err
+		}
+		return value.FloatValue(f), nil
+	case googlesql.TypeKindTypeDouble:
+		f, err := v.DoubleValue()
+		if err != nil {
+			return nil, err
+		}
+		return value.FloatValue(f), nil
 	case googlesql.TypeKindTypeString:
 		return value.StringValue(m1(v.StringValue())), nil
 	case googlesql.TypeKindTypeEnum:
