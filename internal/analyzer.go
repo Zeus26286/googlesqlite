@@ -761,6 +761,44 @@ func renamePositionalParams(query string, args []driver.NamedValue) (string, []d
 	return b.String(), newArgs
 }
 
+// skipLiteralOrComment returns the byte index just past the string
+// literal, quoted identifier or comment that starts at s[i], or i when
+// none starts there. It handles single-, double- and triple-quoted
+// strings, backticked identifiers, and `--`, `#` and `/* */` comments,
+// so a `;`, `?` or apostrophe inside any of them is not mistaken for
+// code. A backslash always skips the next character: even a raw string
+// (r'a\'b') does not end at an escaped quote.
+func skipLiteralOrComment(s string, i int) int {
+	switch c := s[i]; {
+	case c == '-' && strings.HasPrefix(s[i:], "--"), c == '#':
+		if end := strings.IndexByte(s[i:], '\n'); end >= 0 {
+			return i + end
+		}
+		return len(s)
+	case c == '/' && strings.HasPrefix(s[i:], "/*"):
+		if end := strings.Index(s[i+2:], "*/"); end >= 0 {
+			return i + 2 + end + 2
+		}
+		return len(s)
+	case c == '\'' || c == '"' || c == '`':
+		quote := s[i : i+1]
+		if c != '`' && strings.HasPrefix(s[i:], strings.Repeat(quote, 3)) {
+			quote = strings.Repeat(quote, 3)
+		}
+		for j := i + len(quote); j < len(s); j++ {
+			if s[j] == '\\' {
+				j++
+				continue
+			}
+			if strings.HasPrefix(s[j:], quote) {
+				return j + len(quote)
+			}
+		}
+		return len(s)
+	}
+	return i
+}
+
 // queryHasNamedRef reports whether the query contains a `@name`
 // reference outside of string / backtick literals. Used by
 // applyMixedParameterRewrite to recognise mixed-mode syntax at
@@ -1395,8 +1433,8 @@ type sqlRewriteStep struct {
 }
 
 // sqlRewritePipelinePreScriptVars holds the uniform-signature rewrites
-// that run before applyScriptVariables. ORDER IS LOAD-BEARING — these
-// must run in exactly this sequence.
+// that run first. ORDER IS LOAD-BEARING — these must run in exactly
+// this sequence.
 var sqlRewritePipelinePreScriptVars = []sqlRewriteStep{
 	{"typeNameAliases", applyTypeNameAliases},
 	{"naiveTimestampUTC", applyNaiveTimestampUTC},
@@ -1404,7 +1442,8 @@ var sqlRewritePipelinePreScriptVars = []sqlRewriteStep{
 }
 
 // sqlRewritePipelinePostScriptVars holds the uniform-signature rewrites
-// that run after applyScriptVariables. ORDER IS LOAD-BEARING.
+// that run after sqlRewritePipelinePreScriptVars. ORDER IS
+// LOAD-BEARING.
 var sqlRewritePipelinePostScriptVars = []sqlRewriteStep{
 	{"gapFillRewrite", applyGapFillRewrite},
 	{"rangeSessionizeRewrite", applyRangeSessionizeRewrite},
@@ -1498,7 +1537,7 @@ func (a *Analyzer) analyzeStatementLocked(stmt googlesql.ASTStatementNode, mode 
 	}
 	out, err := googlesql.AnalyzeStatementFromParserAST(stmt, a.opt, query, a.catalog.catalog, tf())
 	if err != nil {
-		return nil, fmt.Errorf("failed to analyze: %w", err)
+		return nil, err
 	}
 	stmtNode, _ := out.ResolvedStatement()
 	return stmtNode, nil
@@ -1512,18 +1551,14 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	if err := a.catalog.Sync(ctx, conn); err != nil {
 		return nil, fmt.Errorf("failed to sync catalog: %w", err)
 	}
-	// SQL-rewrite pipeline. ORDER IS LOAD-BEARING. The two rewrites
-	// with non-uniform signatures (applyMixedParameterRewrite needs the
-	// arg slice, applyScriptVariables needs ctx/conn) stay as explicit
-	// calls in their exact positions relative to the uniform pipeline
-	// steps.
+	// SQL-rewrite pipeline. ORDER IS LOAD-BEARING. The rewrite with a
+	// non-uniform signature (applyMixedParameterRewrite needs the arg
+	// slice) stays as an explicit call ahead of the uniform pipeline
+	// steps. Script variables are not a text rewrite: DECLARE / SET run
+	// as statements and references resolve per statement (see
+	// script_vars.go).
 	query, args = applyMixedParameterRewrite(query, args)
-	query, args, err := applyScriptPositionalRewrite(query, args)
-	if err != nil {
-		return nil, err
-	}
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePreScriptVars)
-	query = applyScriptVariables(ctx, query, conn)
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePostScriptVars)
 	parsed, err := a.parseScript(query)
 	if err != nil {
@@ -1542,8 +1577,33 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	if err != nil {
 		return nil, err
 	}
+	declared := map[string]bool{}
 	for i, stmt := range parsed.stmts {
 		stmtArgs := stmtArgsList[i]
+		env := scriptEnv{funcMap: funcMap, tvfMap: tvfMap, args: stmtArgs}
+		switch s := stmt.(type) {
+		case *googlesql.ASTVariableDeclaration:
+			action, err := a.newDeclareAction(s, query, declared, env)
+			if err != nil {
+				return nil, err
+			}
+			actionFuncs = append(actionFuncs, func() (StmtAction, error) { return action, nil })
+			continue
+		case *googlesql.ASTSingleAssignment:
+			action, err := a.newAssignmentAction(s, query, env)
+			if err != nil {
+				return nil, err
+			}
+			actionFuncs = append(actionFuncs, func() (StmtAction, error) { return action, nil })
+			continue
+		case *googlesql.ASTAssignmentFromStruct:
+			action, err := a.newStructAssignmentAction(s, query, env)
+			if err != nil {
+				return nil, err
+			}
+			actionFuncs = append(actionFuncs, func() (StmtAction, error) { return action, nil })
+			continue
+		}
 		// Script-level control-flow AST nodes (IF / WHILE / LOOP /
 		// REPEAT / FOR IN / CASE / RAISE / BREAK / CONTINUE / RETURN
 		// / CALL) are not subclasses of ResolvedStatement, so the
@@ -1559,7 +1619,9 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 			})
 			continue
 		}
+		var keepParsed *parsedScript
 		actionFuncs = append(actionFuncs, func() (StmtAction, error) {
+			_ = keepParsed
 			mode, err := a.getParameterMode(stmt)
 			if err != nil {
 				return nil, err
@@ -1568,15 +1630,18 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 				return nil, err
 			}
 			a.preRegisterWildcardTables(stmt)
-			stmtNode, err := a.analyzeStatementLocked(stmt, mode, stmtArgs, query)
+			resolved, err := a.analyzeResolvingScriptVariables(conn, stmt, mode, stmtArgs, query)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to analyze: %w", err)
 			}
+			// The rewritten statement's parser output must outlive the
+			// action, like parsed does for the original statements.
+			keepParsed = resolved.parsed
 			ctx = a.context(ctx, funcMap, tvfMap)
 			ctx = withSystemVars(ctx, conn.systemVars)
 			ctx = withConn(ctx, conn)
-			src := statementSource{sql: statementText(stmt, query), inScript: len(parsed.stmts) > 1}
-			action, err := a.newStmtAction(withStatementSource(ctx, src), query, stmtArgs, stmtNode)
+			src := statementSource{sql: statementText(resolved.stmt, resolved.sql), inScript: len(parsed.stmts) > 1}
+			action, err := a.newStmtAction(withStatementSource(ctx, src), resolved.sql, stmtArgs, resolved.node)
 			if err != nil {
 				return nil, err
 			}
