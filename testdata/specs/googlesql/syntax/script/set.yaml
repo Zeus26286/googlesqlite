@@ -8,3 +8,55 @@ cases:
     expected:
       rows:
         - [1]
+  # Upstream example: "sets the variable x to have the value 5".
+  - desc: SET of a declared variable
+    setup:
+      - DECLARE x INT64
+      - SET x = 5
+    sql: SELECT x
+    expected:
+      rows:
+        - [5]
+  # Upstream example: "sets the variable a to have the value 4, b to
+  # have the value 'foo', and the variable c to have the value false".
+  - desc: SET of several variables from a struct expression
+    setup:
+      - DECLARE a INT64
+      - DECLARE b STRING
+      - DECLARE c BOOL
+      - SET (a, b, c) = (1 + 3, 'foo', false)
+    sql: SELECT a, b, c
+    expected:
+      rows:
+        - [4, "foo", false]
+  # Upstream example: assigns the result of a SELECT AS STRUCT query to
+  # two variables. word_count is both a variable and a column of the
+  # table; inside the query the column takes precedence. The fixture
+  # holds "methinks" in 38 works with 151 occurrences in total, the
+  # figures of the upstream output.
+  - desc: SET of several variables from a SELECT AS STRUCT query
+    setup:
+      - CREATE TABLE shakespeare (word STRING, word_count INT64, corpus STRING, corpus_date INT64)
+      - >-
+        INSERT INTO shakespeare (word, word_count, corpus, corpus_date)
+        SELECT 'methinks', IF(n = 1, 3, 4), CONCAT('work', CAST(n AS STRING)), 1600
+        FROM UNNEST(GENERATE_ARRAY(1, 38)) AS n
+      - >-
+        INSERT INTO shakespeare (word, word_count, corpus, corpus_date)
+        VALUES ('thee', 9, 'work1', 1600)
+    sql: |
+      DECLARE target_word STRING DEFAULT 'methinks';
+      DECLARE corpus_count, word_count INT64;
+
+      SET (corpus_count, word_count) = (
+        SELECT AS STRUCT COUNT(DISTINCT corpus), SUM(word_count)
+        FROM shakespeare
+        WHERE LOWER(word) = target_word
+      );
+
+      SELECT
+        FORMAT('Found %d occurrences of "%s" across %d Shakespeare works',
+               word_count, target_word, corpus_count) AS result;
+    expected:
+      rows:
+        - ['Found 151 occurrences of "methinks" across 38 Shakespeare works']
