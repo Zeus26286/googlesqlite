@@ -95,3 +95,8 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// Zeus26286/go-googlesql is go-googlesql v0.4.0 plus a fix that slices
+// the wasm memory with uint32 addresses, so a wasm heap past 2 GiB no
+// longer panics with "slice bounds out of range [-2147...:]".
+replace github.com/goccy/go-googlesql => github.com/Zeus26286/go-googlesql v0.0.0-20261120091429-3e76f25f78d2
